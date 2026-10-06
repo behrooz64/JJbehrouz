@@ -1,0 +1,134 @@
+//@version=6
+strategy("JJ Fair Value Theory - NQ v1", overlay=true, pyramiding=0, process_orders_on_close=true, calc_on_order_fills=true)
+
+// Core reference model: NQ 1m, New York time.
+// Fair Value: 09:30 and 14:00 NY.
+// Continuation: first 15 minutes.
+// Reversion: later in session.
+// Entry: confirmed structure break + displacement.
+// Stops: ATR tiers 50 / 25 / 16.5 points. Target: 1.5R.
+// Reconstruction choices are documented in the companion Python backtest.
+
+mode = input.string("Core", "Mode", options=["Core", "Optimized"])
+pivotLeft = input.int(2, "Pivot left bars", minval=1)
+pivotRight = input.int(2, "Pivot right bars", minval=1)
+atrLen = input.int(14, "ATR length", minval=1)
+rr = input.float(1.5, "Risk/Reward", minval=0.1, step=0.1)
+wickPct = input.float(0.20, "Max counter-wick ratio", minval=0.01, maxval=1.0, step=0.01)
+avoidFirst3 = input.bool(true, "Skip first 3 minutes of AM continuation")
+amReversionMinutes = input.int(30, "AM reversion window (minutes)", minval=1)
+pmReversionMinutes = input.int(60, "PM reversion window (minutes)", minval=1)
+pmEndHourCore = input.int(15, "Core PM end hour NY", minval=14, maxval=16)
+pmEndHourOpt = input.int(16, "Optimized PM end hour NY", minval=14, maxval=16)
+
+nyHour = hour(time, "America/New_York")
+nyMinute = minute(time, "America/New_York")
+nyMinutes = nyHour * 60 + nyMinute
+
+amStart = 9 * 60 + 30
+amEnd = 11 * 60
+pmStart = 14 * 60
+pmEnd = (mode == "Core" ? pmEndHourCore : pmEndHourOpt) * 60
+
+inAM = nyMinutes >= amStart and nyMinutes < amEnd
+inPM = nyMinutes >= pmStart and nyMinutes < pmEnd
+inSession = inAM or inPM
+
+isAMStart = nyHour == 9 and nyMinute == 30
+isPMStart = nyHour == 14 and nyMinute == 0
+
+var float amFV = na
+var float pmFV = na
+
+if isAMStart
+    amFV := open
+if isPMStart
+    pmFV := open
+
+fv = inAM ? amFV : inPM ? pmFV : na
+
+atr = ta.atr(atrLen)
+stopDist = atr > 20 ? 50.0 : atr >= 7 ? 25.0 : 16.5
+
+// Confirmed pivots only. This matches the Python reconstruction's 2-left/2-right
+// confirmed swing model and avoids lookahead.
+ph = ta.pivothigh(high, pivotLeft, pivotRight)
+pl = ta.pivotlow(low, pivotLeft, pivotRight)
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+
+if not na(ph)
+    lastSwingHigh := ph
+if not na(pl)
+    lastSwingLow := pl
+
+bullDisplacement = (high - open) > 0 and (open - low) / (high - open) <= wickPct
+bearDisplacement = (open - low) > 0 and (high - open) / (open - low) <= wickPct
+
+bullBreak = not na(lastSwingHigh) and close > lastSwingHigh
+bearBreak = not na(lastSwingLow) and close < lastSwingLow
+
+// Same-candle displacement + structure break.
+longSignal = bullDisplacement and bullBreak
+shortSignal = bearDisplacement and bearBreak
+
+amAge = nyMinutes - amStart
+pmAge = nyMinutes - pmStart
+
+continuationAM = inAM and amAge >= (avoidFirst3 ? 3 : 0) and amAge < 15
+continuationPM = inPM and pmAge < 15
+reversionAM = inAM and amAge >= 15 and amAge < amReversionMinutes
+reversionPM = inPM and pmAge >= 15 and pmAge < pmReversionMinutes
+
+// Continuation must move away from fair value.
+// Reversion must move toward fair value.
+longContinuation = (continuationAM or continuationPM) and close > fv and longSignal
+shortContinuation = (continuationAM or continuationPM) and close < fv and shortSignal
+
+longReversion = (reversionAM or reversionPM) and close < fv and longSignal
+shortReversion = (reversionAM or reversionPM) and close > fv and shortSignal
+
+enterLong = inSession and (longContinuation or longReversion)
+enterShort = inSession and (shortContinuation or shortReversion)
+
+var float activeSL = na
+var float activeTP = na
+
+if strategy.position_size == 0
+    activeSL := na
+    activeTP := na
+
+if enterLong and strategy.position_size == 0
+    activeSL := close - stopDist
+    activeTP := close + stopDist * rr
+    strategy.entry("LONG", strategy.long)
+
+if enterShort and strategy.position_size == 0
+    activeSL := close + stopDist
+    activeTP := close - stopDist * rr
+    strategy.entry("SHORT", strategy.short)
+
+if strategy.position_size > 0 and not na(activeSL)
+    strategy.exit("LONG EXIT", "LONG", stop=activeSL, limit=activeTP)
+
+if strategy.position_size < 0 and not na(activeSL)
+    strategy.exit("SHORT EXIT", "SHORT", stop=activeSL, limit=activeTP)
+
+// Force flat at the end of the active session.
+sessionEnded = (inAM[1] and not inAM) or (inPM[1] and not inPM)
+if sessionEnded and strategy.position_size != 0
+    strategy.close_all(comment="Session close")
+
+plot(amFV, "AM Fair Value", color=color.new(color.blue, 0), linewidth=2, style=plot.style_linebr)
+plot(pmFV, "PM Fair Value", color=color.new(color.orange, 0), linewidth=2, style=plot.style_linebr)
+
+plotshape(enterLong, title="Long signal", style=shape.triangleup, location=location.belowbar, size=size.tiny, color=color.new(color.green, 0), text="L")
+plotshape(enterShort, title="Short signal", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.new(color.red, 0), text="S")
+
+// Notes:
+// 1) This is a TradingView Pine v6 implementation of the reconstructed Python model.
+// 2) Exact swing definition, ATR period, entry fill semantics, and some timing rules
+//    are reconstruction choices where the public source material is not fully mechanical.
+// 3) Core mode uses 14:00-15:00 PM. Optimized mode extends PM to 16:00.
+// 4) Validate parity against the Python backtest on identical NQ 1m data before live use.
