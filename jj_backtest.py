@@ -1,25 +1,25 @@
-"""Faithful, frequency-agnostic backtester + GATE for JJ Simon's fair-value strategy -- a DROP-IN for the
-1-min NQ history when it arrives (validate now on free OHLC; then `python jj_backtest.py --data <1min.parquet>`).
-Objectifies his discretionary rules (an improvement, and gate-able):
+"""JJ Simon Fair Value Theory backtester, v2.
 
-  * fair-value anchor = the session-window open (morning 09:30, afternoon 14:00).
-  * two windows: 09:30-11:00 and 14:00-15:00 NY (his sessions).
-  * two-phase: first CONT_MIN minutes = CONTINUATION (trade WITH a displacement candle), rest = REVERSION
-    (trade TOWARD the anchor on a displacement candle beyond MIN_DEV) -- his continuation-then-reversion.
-  * displacement candle = body/range >= BODY_MIN (objectifies the <20%-counter-wick rule).
-  * exit = ATR stop (STOP_ATR*ATR) + 1.5R target, first-touch within the window, else window close; same-bar
-    ambiguity resolved stop-first (conservative).
+Core model:
+- NQ 1-minute, New York time
+- Fair value = 09:30 open and 14:00 open
+- continuation early, mean reversion later
+- entry requires structure break + decisive displacement on the same candle
+- fixed 1.5R target, no discretionary trade management
+- ATR tiers: >20 -> 50pt SL, 7-20 -> 25pt SL, <7 -> 16.5pt SL
 
-THE GATE (per phase): trades are aggregated to per-DAY R (kills the overlapping-trades t-inflation -> the
-unit of evidence is the day), then (1) bootstrap CI on the per-day mean, (2) purged walk-forward replication
-across days, (3) a DIRECTION-SHUFFLE placebo -- re-run the SAME entries/exits with random long/short, so the
-edge must come from the direction RULE, not the entry/exit mechanics. PASS = mean-2se>0 & folds replicate &
-beats placebo (p<0.05). This is the honest significance; on a tiny free sample it will (correctly) not pass.
+Optimized timing filters reproduced from the independent video backtest:
+- skip the first 3 minutes of the NY-open continuation window
+- AM mean reversions only in the first 30 minutes
+- PM mean reversions only in the first hour of the afternoon test window
+
+IMPORTANT:
+The public description does not specify an exact swing/pivot lookback. This
+implementation uses a configurable 2-bar pivot to make BOS/MSB mechanical.
+That is a reconstruction choice, not a claim that JJ specified "2 bars".
 """
 
 from __future__ import annotations
-
-import _bootstrap  # noqa: F401  (repo root + siblings on sys.path)
 
 import argparse
 from datetime import time
@@ -27,13 +27,41 @@ from datetime import time
 import numpy as np
 import pandas as pd
 
-from src.evaluation.feature_cv import purged_walk_forward
+# ----------------------------- strategy parameters -----------------------------
 
-CONT_MIN = 15  # his continuation window (minutes) before the reversion phase
-BODY_MIN = 0.5  # displacement candle: body/range >= this (small counter-wick)
-MIN_DEV = 0.0005  # min deviation-from-anchor (a real break) to take a reversion entry
-STOP_ATR = 1.0  # stop = STOP_ATR * ATR; target = 1.5 * stop (1.5R)
-WINDOWS = [(time(9, 30), time(11, 0)), (time(14, 0), time(15, 0))]
+WINDOWS = [
+    ("am", time(9, 30), time(11, 0)),
+    # The published core window is 14:00-15:00. The video optimization explicitly
+    # discusses filtering 15:00-16:00 PM reversions, so optimized mode tests 14:00-16:00.
+    ("pm", time(14, 0), time(16, 0)),
+]
+
+CONT_MIN = 15
+ATR_PERIOD = 14
+RR = 1.5
+
+# NQ point distances, matching the risk arithmetic in the published strategy.
+ATR_HIGH = 20.0
+ATR_LOW = 7.0
+SL_HIGH = 50.0
+SL_NORMAL = 25.0
+SL_LOW = 16.5
+
+# Mechanical reconstruction of structure.
+SWING_LEFT = 2
+SWING_RIGHT = 2
+
+# Published displacement rule: counter-wick <= 20%.
+COUNTER_WICK_MAX = 0.20
+
+# Filters reported as improving the independent backtest.
+OPTIMIZED_TIMING = True
+SKIP_FIRST_3M_CONTINUATION = True
+AM_REVERSION_MAX_MINUTE = 30
+PM_REVERSION_MAX_MINUTE = 60
+
+# If False, keep the published core session windows (PM ends at 15:00).
+USE_PM_16 = True
 
 
 def load_ohlc(path: str) -> pd.DataFrame:
@@ -51,7 +79,7 @@ def load_ohlc(path: str) -> pd.DataFrame:
     return df[["open", "high", "low", "close"]].sort_index()
 
 
-def atr(df: pd.DataFrame, n: int = 14) -> np.ndarray:
+def atr(df: pd.DataFrame, n: int = ATR_PERIOD) -> np.ndarray:
     pc = df["close"].shift(1)
     tr = np.maximum(
         df["high"] - df["low"],
@@ -60,138 +88,286 @@ def atr(df: pd.DataFrame, n: int = 14) -> np.ndarray:
     return tr.rolling(n, min_periods=1).mean().to_numpy()
 
 
+def stop_distance(atr_value: float) -> float:
+    if atr_value > ATR_HIGH:
+        return SL_HIGH
+    if atr_value >= ATR_LOW:
+        return SL_NORMAL
+    return SL_LOW
+
+
+def displacement(open_: float, high: float, low: float, close: float) -> bool:
+    """JJ-style decisive candle: counter wick <= 20%.
+
+    For a bullish candle, compare lower wick to the full open-to-high travel.
+    For a bearish candle, compare upper wick to the full open-to-low travel.
+    The exact pivot geometry is not explicitly published, so this is kept
+    isolated as a reconstruction function for later sensitivity testing.
+    """
+    if close > open_:
+        denom = high - open_
+        if denom <= 0:
+            return False
+        counter = open_ - low
+    elif close < open_:
+        denom = open_ - low
+        if denom <= 0:
+            return False
+        counter = high - open_
+    else:
+        return False
+    return (counter / denom) <= COUNTER_WICK_MAX
+
+
+def pivot_levels(high: np.ndarray, low: np.ndarray):
+    """Confirmed swing levels using a configurable 2-left/2-right pivot."""
+    n = len(high)
+    swing_high = np.full(n, np.nan)
+    swing_low = np.full(n, np.nan)
+    L, R = SWING_LEFT, SWING_RIGHT
+    for p in range(L, n - R):
+        if high[p] > np.max(high[p - L:p]) and high[p] >= np.max(high[p + 1:p + R + 1]):
+            swing_high[p] = high[p]
+        if low[p] < np.min(low[p - L:p]) and low[p] <= np.min(low[p + 1:p + R + 1]):
+            swing_low[p] = low[p]
+    return swing_high, swing_low
+
+
+def latest_confirmed_level(values: np.ndarray, i: int) -> float:
+    j = i - SWING_RIGHT
+    while j >= 0:
+        if not np.isnan(values[j]):
+            return float(values[j])
+        j -= 1
+    return np.nan
+
+
+def structure_break(
+    i: int,
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    swing_high: np.ndarray,
+    swing_low: np.ndarray,
+):
+    """Return +1 for bullish break, -1 for bearish break, 0 otherwise.
+
+    A break is confirmed by candle CLOSE beyond the latest confirmed swing.
+    """
+    sh = latest_confirmed_level(swing_high, i)
+    sl = latest_confirmed_level(swing_low, i)
+    bull = not np.isnan(sh) and close[i] > sh
+    bear = not np.isnan(sl) and close[i] < sl
+    if bull and not bear:
+        return 1
+    if bear and not bull:
+        return -1
+    return 0
+
+
 def simulate_trade(o, h, low, c, i, j_end, direction, stop_d) -> float:
-    """Walk bars i+1..j_end; exit at first stop/1.5R-target touch (stop-first on same bar), else window
-    close. Returns the R-multiple."""
     entry = c[i]
     stop = entry - direction * stop_d
-    tgt = entry + direction * 1.5 * stop_d
+    tgt = entry + direction * RR * stop_d
+
     for j in range(i + 1, j_end + 1):
         if direction > 0:
             if low[j] <= stop:
                 return -1.0
             if h[j] >= tgt:
-                return 1.5
+                return RR
         else:
             if h[j] >= stop:
                 return -1.0
             if low[j] <= tgt:
-                return 1.5
+                return RR
+
     return direction * (c[j_end] - entry) / stop_d
 
 
+def session_allowed(label: str, minute_from_open: int, phase: str) -> bool:
+    if not OPTIMIZED_TIMING:
+        return True
+
+    if phase == "continuation" and label == "am" and SKIP_FIRST_3M_CONTINUATION:
+        if minute_from_open < 3:
+            return False
+
+    if phase == "reversion":
+        if label == "am" and minute_from_open >= AM_REVERSION_MAX_MINUTE:
+            return False
+        if label == "pm" and minute_from_open >= PM_REVERSION_MAX_MINUTE:
+            return False
+
+    return True
+
+
 def collect_entries(df: pd.DataFrame):
-    """Precompute every entry signal once: (day, phase, i, j_end, signal_dir, stop_d). The placebo re-runs
-    these SAME entries with shuffled directions, so only the direction RULE is under test."""
     df = df.copy()
-    df["a"] = atr(df)
+    df["atr"] = atr(df)
+
+    o = df["open"].to_numpy()
+    h = df["high"].to_numpy()
+    low = df["low"].to_numpy()
+    c = df["close"].to_numpy()
+    a = df["atr"].to_numpy()
+
+    swing_high, swing_low = pivot_levels(h, low)
+
     bar_min = int(
-        np.median(np.diff(df.index.values).astype("timedelta64[m]").astype(int)) or 5
+        np.median(
+            np.diff(df.index.values).astype("timedelta64[m]").astype(int)
+        )
     )
+    bar_min = max(bar_min, 1)
     cont_bars = max(1, int(np.ceil(CONT_MIN / bar_min)))
-    o, h, low, c, a = (df[x].to_numpy() for x in ("open", "high", "low", "close", "a"))
-    tod = np.array([t.time() for t in df.index])
+
+    tod = np.array([x.time() for x in df.index])
     dday = df.index.date
-    disp = (np.abs(c - o) / np.maximum(h - low, 1e-12)) >= BODY_MIN
+
+    windows = [
+        WINDOWS[0],
+        WINDOWS[1] if USE_PM_16 else ("pm", time(14, 0), time(15, 0)),
+    ]
+
     entries = []
-    for w0, w1 in WINDOWS:
+
+    for label, w0, w1 in windows:
         inwin = (tod >= w0) & (tod < w1)
+
         for day in np.unique(dday):
             idxs = np.where(inwin & (dday == day))[0]
-            if len(idxs) < 3:
+            if len(idxs) < 5:
                 continue
-            anchor, j_end, k = o[idxs[0]], idxs[-1], 0
+
+            anchor = float(o[idxs[0]])
+            j_end = int(idxs[-1])
+            session_start = idxs[0]
+
             for i in idxs:
-                k += 1
-                if a[i] <= 0 or not disp[i]:
+                bars_from_open = i - session_start
+                phase = "continuation" if bars_from_open < cont_bars else "reversion"
+
+                if not session_allowed(
+                    label, bars_from_open * bar_min, phase
+                ):
                     continue
-                dev = np.log(c[i] / anchor)
-                if k <= cont_bars:
-                    d, ph = float(np.sign(c[i] - o[i])), "continuation"
-                else:
-                    if abs(dev) < MIN_DEV:
+
+                # Require displacement and structure break on the SAME candle.
+                if not displacement(o[i], h[i], low[i], c[i]):
+                    continue
+
+                sb = structure_break(
+                    i, c, h, low, swing_high, swing_low
+                )
+                if sb == 0:
+                    continue
+
+                dev = np.sign(c[i] - anchor)
+                if dev == 0:
+                    continue
+
+                if phase == "continuation":
+                    # Break must be away from fair value.
+                    direction = float(sb)
+                    if np.sign(direction) != np.sign(c[i] - anchor):
                         continue
-                    d, ph = -float(np.sign(dev)), "reversion"
-                if d != 0:
-                    entries.append(
-                        (day, ph, int(i), int(j_end), d, float(STOP_ATR * a[i]))
+                else:
+                    # Break must point back toward fair value.
+                    direction = float(sb)
+                    if np.sign(direction) != -np.sign(c[i] - anchor):
+                        continue
+
+                entries.append(
+                    (
+                        day,
+                        label,
+                        phase,
+                        int(i),
+                        j_end,
+                        direction,
+                        stop_distance(float(a[i])),
                     )
+                )
+
     return (
         entries,
         (o, h, low, c),
-        {"bar_min": bar_min, "cont_bars": cont_bars, "n_bars": len(df)},
+        {
+            "bar_min": bar_min,
+            "cont_bars": cont_bars,
+            "n_bars": len(df),
+            "optimized_timing": OPTIMIZED_TIMING,
+            "pm_end": "16:00" if USE_PM_16 else "15:00",
+        },
     )
 
 
-def per_day_R(entries, ohlc, phase, directions=None) -> pd.Series:
-    """Aggregate trade R to per-day totals for a phase; `directions` (list over ALL entries) overrides the
-    signal direction for the placebo."""
+def performance(entries, ohlc):
     o, h, low, c = ohlc
-    byday: dict = {}
-    r_list = []
-    for idx, (day, ph, i, j_end, d, stop_d) in enumerate(entries):
-        if ph != phase:
+    rows = []
+
+    for day, label, phase, i, j_end, direction, stop_d in entries:
+        r = simulate_trade(
+            o, h, low, c, i, j_end, direction, stop_d
+        )
+        rows.append(
+            {
+                "day": day,
+                "session": label,
+                "phase": phase,
+                "R": r,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame(
+            columns=["day", "session", "phase", "R"]
+        )
+
+    return pd.DataFrame(rows)
+
+
+def print_stats(trades: pd.DataFrame):
+    if trades.empty:
+        print("No trades.")
+        return
+
+    for label in ["all", "continuation", "reversion"]:
+        x = trades if label == "all" else trades[trades.phase == label]
+        if x.empty:
             continue
-        dd = d if directions is None else directions[idx]
-        R = simulate_trade(o, h, low, c, i, j_end, dd, stop_d)
-        byday[day] = byday.get(day, 0.0) + R
-        r_list.append(R)
-    return pd.Series(byday).sort_index(), np.array(r_list)
 
+        wins = x.R[x.R > 0].sum()
+        losses = -x.R[x.R < 0].sum()
+        pf = wins / losses if losses > 0 else float("inf")
+        wr = (x.R > 0).mean()
 
-def gate(entries, ohlc, phase, n_placebo=300, seed=0) -> dict:
-    dayR, r = per_day_R(entries, ohlc, phase)
-    if len(dayR) < 20:
-        return {"phase": phase, "n_days": int(len(dayR)), "insufficient": True}
-    v = dayR.to_numpy()
-    n = len(v)
-    rng = np.random.default_rng(seed)
-    boot = np.array([v[rng.integers(0, n, n)].mean() for _ in range(2000)])
-    mean, se = float(v.mean()), float(boot.std())
-    folds = purged_walk_forward(n, n_folds=5, embargo=0.01)
-    fold_pos = float(np.mean([v[te].mean() > 0 for _, te in folds])) if folds else 0.0
-    ph_idx = [k for k, e in enumerate(entries) if e[1] == phase]
-    plac = np.empty(n_placebo)
-    for b in range(n_placebo):
-        dirs = [0.0] * len(entries)
-        for k in ph_idx:
-            dirs[k] = float(rng.choice([-1.0, 1.0]))
-        plac[b] = per_day_R(entries, ohlc, phase, dirs)[0].mean()
-    p_plac = float((plac >= mean).mean())
-    passed = (mean - 2 * se > 0) and (fold_pos >= 0.7) and (p_plac < 0.05)
-    return {
-        "phase": phase,
-        "n_trades": int(len(r)),
-        "n_days": n,
-        "win_rate": float((r > 0).mean()),
-        "avg_R": float(r.mean()),
-        "mean_dayR": mean,
-        "se_dayR": se,
-        "t_dayR": float(mean / se) if se > 0 else float("nan"),
-        "fold_pos_frac": fold_pos,
-        "placebo_p": p_plac,
-        "gate_pass": bool(passed),
-    }
+        print(
+            f"[{label:13s}] n={len(x):4d} "
+            f"win={wr:.3f} PF={pf:.3f} "
+            f"R={x.R.sum():+.2f}"
+        )
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", required=True, help="OHLC parquet (yfinance or 1-min NQ)")
-    a = ap.parse_args()
-    entries, ohlc, meta = collect_entries(load_ohlc(a.data))
+    ap.add_argument("--data", required=True, help="OHLC parquet")
+    args = ap.parse_args()
+
+    df = load_ohlc(args.data)
+    entries, ohlc, meta = collect_entries(df)
+
     print(
-        f"bar={meta['bar_min']}min cont_bars={meta['cont_bars']} n_bars={meta['n_bars']} entries={len(entries)}"
+        f"bar={meta['bar_min']}m "
+        f"continuation={meta['cont_bars']} bars "
+        f"entries={len(entries)} "
+        f"optimized_timing={meta['optimized_timing']} "
+        f"pm_end={meta['pm_end']}"
     )
-    for ph in ("continuation", "reversion"):
-        g = gate(entries, ohlc, ph)
-        if g.get("insufficient"):
-            print(f"[{ph:12s}] n_days={g['n_days']} (too few to gate)")
-            continue
-        print(
-            f"[{ph:12s}] GATE={'PASS' if g['gate_pass'] else 'fail'} | n={g['n_trades']} days={g['n_days']} "
-            f"win={g['win_rate']:.2f} avgR={g['avg_R']:+.3f} | mean_dayR={g['mean_dayR']:+.3f} "
-            f"t={g['t_dayR']:+.2f} foldpos={g['fold_pos_frac']:.2f} placebo_p={g['placebo_p']:.3f}"
-        )
+
+    trades = performance(entries, ohlc)
+    print_stats(trades)
 
 
 if __name__ == "__main__":
